@@ -1,0 +1,797 @@
+import React, { useState, useEffect } from "react";
+import { 
+  FileSpreadsheet, 
+  Plus, 
+  Search, 
+  RefreshCw, 
+  LogOut, 
+  Loader2, 
+  ExternalLink, 
+  Trash2, 
+  PlusSquare, 
+  ArrowLeft, 
+  CheckCircle, 
+  AlertCircle, 
+  Grid, 
+  ArrowRight,
+  Database,
+  UserCheck
+} from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
+import { toast } from "sonner";
+import { cn } from "../lib/utils";
+import { useAuth } from "../components/AuthProvider";
+import { connectSheets, getSheetsToken, disconnectSheets } from "../lib/googleAuth";
+import { 
+  listSpreadsheets, 
+  getSpreadsheetMetadata, 
+  getSheetValues, 
+  appendSheetRow, 
+  createCampaignSpreadsheet, 
+  SpreadsheetFile, 
+  SheetMetadata 
+} from "../lib/sheetsService";
+import { deleteDriveFile } from "../lib/driveService";
+
+export default function CampaignSheets() {
+  const { userData } = useAuth();
+  const role = userData?.role || "creator";
+
+  // Auth State
+  const [token, setToken] = useState<string | null>(null);
+  
+  // Spreadsheet Lists and Loading States
+  const [spreadsheets, setSpreadsheets] = useState<SpreadsheetFile[]>([]);
+  const [loadingList, setLoadingList] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+
+  // Selected Spreadsheet View
+  const [selectedSheet, setSelectedSheet] = useState<SpreadsheetFile | null>(null);
+  const [sheetMeta, setSheetMeta] = useState<SheetMetadata | null>(null);
+  const [loadingMeta, setLoadingMeta] = useState<boolean>(false);
+  const [activeWorksheet, setActiveWorksheet] = useState<string>("");
+  
+  // Sheet Cell Data State
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [rows, setRows] = useState<string[][]>([]);
+  const [loadingCells, setLoadingCells] = useState<boolean>(false);
+  const [tableSearch, setTableSearch] = useState<string>("");
+
+  // Create Row Dialog State
+  const [isAddRowModalOpen, setIsAddRowModalOpen] = useState<boolean>(false);
+  const [newRowData, setNewRowData] = useState<Record<string, string>>({});
+  const [submittingRow, setSubmittingRow] = useState<boolean>(false);
+
+  // New Spreadsheet Dialog State
+  const [isCreateSheetModalOpen, setIsCreateSheetModalOpen] = useState<boolean>(false);
+  const [newSheetTitle, setNewSheetTitle] = useState<string>("");
+  const [creatingSheet, setCreatingSheet] = useState<boolean>(false);
+
+  // Load token on mount
+  useEffect(() => {
+    const cached = getSheetsToken();
+    if (cached) {
+      setToken(cached);
+      loadSpreadsheetList(cached);
+    }
+  }, []);
+
+  // Fetch list of spreadsheets
+  const loadSpreadsheetList = async (accessToken: string) => {
+    setLoadingList(true);
+    try {
+      const files = await listSpreadsheets(accessToken);
+      setSpreadsheets(files);
+    } catch (err: any) {
+      console.error("Error fetching spreadsheets:", err);
+      if (err.message?.includes("401") || err.message?.includes("unauthorized") || err.message?.includes("Unauthorized")) {
+        toast.error("Google Sheets session expired. Please connect again.");
+        handleDisconnect();
+      } else {
+        toast.error("Failed to load spreadsheets from Google Drive.");
+      }
+    } finally {
+      setLoadingList(false);
+    }
+  };
+
+  const handleConnect = async () => {
+    const loader = toast.loading("Authenticating with Google Sheets...");
+    try {
+      const accessToken = await connectSheets();
+      setToken(accessToken);
+      toast.dismiss(loader);
+      toast.success("Successfully linked Google Sheets workspace!");
+      loadSpreadsheetList(accessToken);
+    } catch (err: any) {
+      toast.dismiss(loader);
+      toast.error(err.message || "Failed to link Google account.");
+    }
+  };
+
+  const handleDisconnect = () => {
+    disconnectSheets();
+    setToken(null);
+    setSpreadsheets([]);
+    setSelectedSheet(null);
+    setSheetMeta(null);
+    setHeaders([]);
+    setRows([]);
+    toast.success("Disconnected Google Sheets integration.");
+  };
+
+  // Open specific spreadsheet & fetch metadata (worksheets)
+  const handleOpenSpreadsheet = async (sheetFile: SpreadsheetFile) => {
+    if (!token) return;
+    setSelectedSheet(sheetFile);
+    setLoadingMeta(true);
+    setHeaders([]);
+    setRows([]);
+    
+    try {
+      const meta = await getSpreadsheetMetadata(token, sheetFile.id);
+      setSheetMeta(meta);
+      
+      // Default to first worksheet tab
+      if (meta.sheets && meta.sheets.length > 0) {
+        const firstTab = meta.sheets[0].properties.title;
+        setActiveWorksheet(firstTab);
+        loadWorksheetCells(sheetFile.id, firstTab);
+      }
+    } catch (err: any) {
+      toast.error("Failed to load spreadsheet details.");
+      setSelectedSheet(null);
+    } finally {
+      setLoadingMeta(false);
+    }
+  };
+
+  // Load specific worksheet tab cells
+  const loadWorksheetCells = async (spreadsheetId: string, worksheetTitle: string) => {
+    if (!token) return;
+    setLoadingCells(true);
+    try {
+      // Read values for active worksheet tab
+      const data = await getSheetValues(token, spreadsheetId, `${worksheetTitle}!A1:Z250`);
+      if (data.values && data.values.length > 0) {
+        setHeaders(data.values[0]);
+        setRows(data.values.slice(1));
+        
+        // Initialize dynamic add-row state keys based on headers
+        const initialFormState: Record<string, string> = {};
+        data.values[0].forEach(h => {
+          initialFormState[h] = "";
+        });
+        setNewRowData(initialFormState);
+      } else {
+        setHeaders([]);
+        setRows([]);
+      }
+    } catch (err: any) {
+      toast.error(`Failed to load sheet values for tab: ${worksheetTitle}`);
+    } finally {
+      setLoadingCells(false);
+    }
+  };
+
+  // Create template spreadsheet tracker
+  const handleCreateCampaignSheet = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !newSheetTitle.trim()) return;
+
+    setCreatingSheet(true);
+    const loader = toast.loading(`Creating spreadsheet '${newSheetTitle}'...`);
+    try {
+      const created = await createCampaignSpreadsheet(token, newSheetTitle.trim());
+      toast.dismiss(loader);
+      toast.success("Campaign Tracker spreadsheet created successfully!");
+      setIsCreateSheetModalOpen(false);
+      setNewSheetTitle("");
+      
+      // Reload lists and automatically open the newly created spreadsheet
+      await loadSpreadsheetList(token);
+      handleOpenSpreadsheet({
+        id: created.spreadsheetId,
+        name: created.properties.title
+      });
+    } catch (err: any) {
+      toast.dismiss(loader);
+      toast.error(err.message || "Failed to create tracker sheet.");
+    } finally {
+      setCreatingSheet(false);
+    }
+  };
+
+  // Dynamic Row Appending Submit
+  const handleAddRowSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !selectedSheet || !activeWorksheet) return;
+
+    setSubmittingRow(true);
+    try {
+      // Map form state keys exactly in the order of headers
+      const orderedValues = headers.map(header => newRowData[header] || "");
+      
+      // Call append values
+      await appendSheetRow(token, selectedSheet.id, `${activeWorksheet}!A1`, orderedValues);
+      
+      toast.success("New row successfully written to Google Sheets!");
+      setIsAddRowModalOpen(false);
+      
+      // Reset form
+      const cleared: Record<string, string> = {};
+      headers.forEach(h => { cleared[h] = ""; });
+      setNewRowData(cleared);
+
+      // Refresh sheet cells
+      loadWorksheetCells(selectedSheet.id, activeWorksheet);
+    } catch (err: any) {
+      toast.error(err.message || "Failed to append row to spreadsheet.");
+    } finally {
+      setSubmittingRow(false);
+    }
+  };
+
+  // Delete Spreadsheet File (WITH MANDATORY User Confirmation Dialog per guidelines!)
+  const handleDeleteSpreadsheet = async (sheetFile: SpreadsheetFile, e: React.MouseEvent) => {
+    e.stopPropagation(); // Avoid triggering Row Click / Open Sheet
+    
+    const confirmed = window.confirm(
+      `Are you sure you want to permanently delete the Google Spreadsheet '${sheetFile.name}' from your Drive? This action cannot be undone.`
+    );
+    
+    if (!confirmed) return;
+
+    const loader = toast.loading(`Deleting ${sheetFile.name}...`);
+    try {
+      if (!token) return;
+      await deleteDriveFile(token, sheetFile.id);
+      toast.dismiss(loader);
+      toast.success("Spreadsheet deleted successfully.");
+      
+      // If deleted sheet is currently open, go back
+      if (selectedSheet?.id === sheetFile.id) {
+        setSelectedSheet(null);
+        setSheetMeta(null);
+        setHeaders([]);
+        setRows([]);
+      }
+      
+      loadSpreadsheetList(token);
+    } catch (err: any) {
+      toast.dismiss(loader);
+      toast.error(err.message || "Failed to delete spreadsheet.");
+    }
+  };
+
+  // Filter local rows displayed based on search
+  const filteredLocalRows = rows.filter(row => {
+    if (!tableSearch) return true;
+    return row.some(cell => cell.toLowerCase().includes(tableSearch.toLowerCase()));
+  });
+
+  // Filter spreadsheet list based on Drive search input
+  const filteredSheetsList = spreadsheets.filter(sheet => {
+    if (!searchQuery) return true;
+    return sheet.name.toLowerCase().includes(searchQuery.toLowerCase());
+  });
+
+  return (
+    <div className="flex h-full flex-col bg-[#FAFAFA]">
+      {/* HEADER SECTION */}
+      <header className="sticky top-0 z-10 bg-white/80 backdrop-blur-md border-b border-gray-100 px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-[#34A853]/10 text-[#34A853] rounded-2xl flex items-center justify-center shrink-0">
+            <FileSpreadsheet className="w-5 h-5" />
+          </div>
+          <div>
+            <h1 className="text-xl font-black tracking-tight text-[#141414] uppercase">
+              Campaign Sheets Hub
+            </h1>
+            <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mt-0.5">
+              Sync metrics & briefs from Google Sheets
+            </p>
+          </div>
+        </div>
+
+        {token && (
+          <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
+            {!selectedSheet ? (
+              <button 
+                onClick={() => loadSpreadsheetList(token)}
+                className="p-2.5 bg-gray-100 rounded-full hover:bg-gray-200 text-gray-600 transition-all hover:rotate-45"
+                title="Refresh sheets"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            ) : (
+              <button 
+                onClick={() => loadWorksheetCells(selectedSheet.id, activeWorksheet)}
+                className="p-2.5 bg-gray-100 rounded-full hover:bg-gray-200 text-gray-600 transition-all hover:rotate-45"
+                title="Refresh worksheet values"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            )}
+            <button 
+              onClick={handleDisconnect}
+              className="flex items-center gap-2 px-4 py-2 border border-rose-200 text-rose-600 bg-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-rose-50 transition-all shadow-sm"
+            >
+              <LogOut className="w-3.5 h-3.5" /> Disconnect
+            </button>
+          </div>
+        )}
+      </header>
+
+      <div className="flex-1 overflow-y-auto p-6 md:p-8 max-w-7xl mx-auto w-full">
+        <AnimatePresence mode="wait">
+          {!token ? (
+            /* AUTH / HERO CONNECT CONTAINER */
+            <motion.div 
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              className="max-w-2xl mx-auto my-12"
+            >
+              <div className="bg-white rounded-3xl p-8 md:p-12 border border-gray-200/60 shadow-xl relative overflow-hidden text-center">
+                <div className="absolute top-0 right-0 w-32 h-32 bg-[#34A853]/10 opacity-20 blur-3xl"></div>
+                <div className="absolute -bottom-8 -left-8 w-32 h-32 bg-[#A855F7]/10 opacity-10 blur-3xl"></div>
+                
+                <div className="w-16 h-16 bg-[#34A853] text-white rounded-3xl flex items-center justify-center mx-auto mb-6 shadow-md">
+                  <FileSpreadsheet className="w-8 h-8" />
+                </div>
+
+                <span className="px-3 py-1 bg-emerald-100 text-[#059669] text-[9px] font-black uppercase tracking-widest rounded-full">
+                  Google Sheets Integration
+                </span>
+
+                <h2 className="text-2xl sm:text-3xl font-black tracking-tight text-[#141414] mt-4 mb-3 uppercase">
+                  Synchronize Campaign Data
+                </h2>
+
+                <p className="text-sm text-gray-500 leading-relaxed max-w-md mx-auto mb-8 font-medium">
+                  Connect your brand or creator account with Google Sheets. View spreadsheet entries, track campaign deliverables, input budgets, and sync milestones in real-time.
+                </p>
+
+                {/* Sign-in button conforming to styles in guidelines */}
+                <button 
+                  onClick={handleConnect}
+                  className="inline-flex items-center gap-3 px-6 py-3.5 bg-[#141414] text-white hover:bg-gray-800 transition-all rounded-2xl shadow-lg hover:shadow-xl font-black text-xs uppercase tracking-widest"
+                >
+                  <svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" className="w-4 h-4 shrink-0">
+                    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+                    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+                    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
+                    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+                  </svg>
+                  Connect Google Sheets
+                </button>
+
+                <div className="grid grid-cols-3 gap-4 mt-12 pt-8 border-t border-gray-100">
+                  <div className="text-center">
+                    <p className="text-xl font-bold text-[#141414]">Live Sync</p>
+                    <p className="text-[9px] text-gray-400 uppercase tracking-wider font-black">2-Way Data Flow</p>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-xl font-bold text-[#141414]">Flexible</p>
+                    <p className="text-[9px] text-gray-400 uppercase tracking-wider font-black">Dynamic Tables</p>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-xl font-bold text-[#141414]">Free Form</p>
+                    <p className="text-[9px] text-gray-400 uppercase tracking-wider font-black">Custom Headers</p>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          ) : !selectedSheet ? (
+            /* LIST OF SPREADSHEETS VIEW */
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="space-y-6"
+            >
+              {/* Toolbar */}
+              <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
+                <div className="relative w-full md:max-w-md">
+                  <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input 
+                    type="text" 
+                    placeholder="Search spreadsheets in your Drive..." 
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="pl-9 pr-4 py-2 w-full bg-white border border-gray-200 rounded-full text-xs outline-none focus:ring-2 focus:ring-[#34A853]/20 transition-all font-medium"
+                  />
+                </div>
+
+                <div className="flex items-center gap-3 w-full md:w-auto justify-end">
+                  <button 
+                    onClick={() => setIsCreateSheetModalOpen(true)}
+                    className="flex items-center gap-1.5 px-4 py-2 bg-[#34A853] hover:brightness-110 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-md"
+                  >
+                    <PlusSquare className="w-4 h-4" /> Create Campaign Tracker
+                  </button>
+                </div>
+              </div>
+
+              {/* LIST DISPLAY */}
+              <div className="bg-white rounded-3xl border border-gray-100 shadow-sm overflow-hidden">
+                {loadingList ? (
+                  <div className="flex flex-col items-center justify-center py-24 gap-4">
+                    <Loader2 className="w-10 h-10 animate-spin text-[#34A853]" />
+                    <p className="text-xs font-black uppercase tracking-widest text-gray-400">Fetching Spreadsheets...</p>
+                  </div>
+                ) : filteredSheetsList.length === 0 ? (
+                  <div className="p-16 text-center max-w-sm mx-auto">
+                    <Database className="w-12 h-12 text-gray-300 mx-auto mb-4" />
+                    <h3 className="font-bold text-sm text-[#141414] mb-1">No Spreadsheets Found</h3>
+                    <p className="text-xs text-gray-500 leading-relaxed font-medium mb-6">
+                      We couldn't find any spreadsheets in your Drive. Create a new campaign-ready tracker below to get started.
+                    </p>
+                    <button 
+                      onClick={() => setIsCreateSheetModalOpen(true)}
+                      className="px-5 py-2.5 bg-gray-100 hover:bg-gray-200 text-[#141414] rounded-xl text-[10px] font-black uppercase tracking-widest transition-all"
+                    >
+                      Make First Spreadsheet
+                    </button>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-gray-100">
+                    <div className="grid grid-cols-12 px-6 py-3.5 bg-gray-50 text-[10px] font-black uppercase tracking-wider text-gray-400">
+                      <div className="col-span-8">Spreadsheet Title</div>
+                      <div className="col-span-3 text-right">Created Date</div>
+                      <div className="col-span-1 text-right">Actions</div>
+                    </div>
+
+                    {filteredSheetsList.map((sheet) => (
+                      <div 
+                        key={sheet.id}
+                        onClick={() => handleOpenSpreadsheet(sheet)}
+                        className="grid grid-cols-12 px-6 py-4 items-center hover:bg-gray-50/50 cursor-pointer transition-all group"
+                      >
+                        <div className="col-span-8 flex items-center gap-3.5 min-w-0">
+                          <div className="w-10 h-10 rounded-xl bg-emerald-50 text-[#34A853] flex items-center justify-center shrink-0 group-hover:scale-105 transition-all">
+                            <FileSpreadsheet className="w-5 h-5" />
+                          </div>
+                          <div className="min-w-0">
+                            <h4 className="font-bold text-sm text-[#141414] truncate group-hover:text-[#34A853] transition-colors">
+                              {sheet.name}
+                            </h4>
+                            <p className="text-[9px] font-semibold text-gray-400 uppercase tracking-widest mt-0.5">
+                              ID: {sheet.id.substring(0, 16)}...
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="col-span-3 text-right text-xs font-semibold text-gray-500">
+                          {sheet.createdTime ? new Date(sheet.createdTime).toLocaleDateString() : "—"}
+                        </div>
+
+                        <div className="col-span-1 flex justify-end">
+                          <button 
+                            onClick={(e) => handleDeleteSpreadsheet(sheet, e)}
+                            className="p-2 hover:bg-rose-50 text-gray-400 hover:text-rose-600 rounded-xl transition-all"
+                            title="Delete file permanently"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          ) : (
+            /* DETAILED SINGLE SPREADSHEET VIEWER */
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.99 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0 }}
+              className="space-y-6"
+            >
+              {/* Toolbar & Meta */}
+              <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
+                <button 
+                  onClick={() => {
+                    setSelectedSheet(null);
+                    setSheetMeta(null);
+                    setHeaders([]);
+                    setRows([]);
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-xl text-xs font-bold transition-all"
+                >
+                  <ArrowLeft className="w-4 h-4" /> Back to Files
+                </button>
+
+                <div className="flex flex-wrap gap-2">
+                  {selectedSheet.webViewLink && (
+                    <a 
+                      href={selectedSheet.webViewLink} 
+                      target="_blank" 
+                      rel="noreferrer noopener"
+                      className="flex items-center gap-1.5 px-4 py-2 border border-gray-200 bg-white hover:bg-gray-50 text-gray-700 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-sm"
+                    >
+                      Open in Google Sheets <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  )}
+                  {headers.length > 0 && (
+                    <button 
+                      onClick={() => setIsAddRowModalOpen(true)}
+                      className="flex items-center gap-1.5 px-4 py-2 bg-[#34A853] hover:brightness-110 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-md"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> Append Row
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Title Header Card */}
+              <div className="bg-white border border-gray-100 rounded-3xl p-6 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-xl font-black text-[#141414] uppercase">{selectedSheet.name}</h2>
+                  <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest mt-1">
+                    Spreadsheet ID: {selectedSheet.id}
+                  </p>
+                </div>
+
+                {/* Worksheet Tab Selectors */}
+                {sheetMeta?.sheets && sheetMeta.sheets.length > 1 && (
+                  <div className="flex items-center gap-1.5 bg-gray-50 border border-gray-100 p-1.5 rounded-2xl overflow-x-auto max-w-full">
+                    {sheetMeta.sheets.map((s) => {
+                      const tabTitle = s.properties.title;
+                      const isActive = activeWorksheet === tabTitle;
+                      return (
+                        <button 
+                          key={s.properties.sheetId}
+                          onClick={() => {
+                            setActiveWorksheet(tabTitle);
+                            loadWorksheetCells(selectedSheet.id, tabTitle);
+                          }}
+                          className={cn(
+                            "px-3.5 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+                            isActive 
+                              ? "bg-white text-[#34A853] shadow-sm font-black" 
+                              : "text-gray-400 hover:text-[#141414]"
+                          )}
+                        >
+                          {tabTitle}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* GRID CELLS SPREADSHEET VIEW */}
+              <div className="bg-white border border-gray-100 rounded-3xl shadow-sm overflow-hidden">
+                {/* Search & Statistics */}
+                <div className="px-6 py-4 border-b border-gray-100 bg-gray-50/50 flex flex-col md:flex-row items-center justify-between gap-4">
+                  <div className="relative w-full md:max-w-xs">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input 
+                      type="text" 
+                      placeholder="Filter columns / search rows..." 
+                      value={tableSearch}
+                      onChange={(e) => setTableSearch(e.target.value)}
+                      className="pl-9 pr-4 py-1.5 w-full bg-white border border-gray-200 rounded-full text-xs outline-none focus:ring-2 focus:ring-[#34A853]/20 transition-all font-medium"
+                    />
+                  </div>
+
+                  <div className="text-[10px] font-black text-gray-400 uppercase tracking-widest flex items-center gap-4">
+                    <span>Columns: {headers.length}</span>
+                    <span className="w-1 h-1 bg-gray-300 rounded-full"></span>
+                    <span>Total Rows: {rows.length}</span>
+                  </div>
+                </div>
+
+                {loadingMeta || loadingCells ? (
+                  <div className="flex flex-col items-center justify-center py-24 gap-4">
+                    <Loader2 className="w-10 h-10 animate-spin text-[#34A853]" />
+                    <p className="text-xs font-black uppercase tracking-widest text-gray-400">Syncing Cell Ranges...</p>
+                  </div>
+                ) : headers.length === 0 ? (
+                  <div className="p-16 text-center max-w-sm mx-auto">
+                    <AlertCircle className="w-12 h-12 text-gray-300 mx-auto mb-4" />
+                    <h3 className="font-bold text-sm text-[#141414] mb-1">Spreadsheet Tab Empty</h3>
+                    <p className="text-xs text-gray-500 leading-relaxed font-medium mb-6">
+                      This active worksheet tab is blank. Create headers in row 1 to structure your data, or write rows directly.
+                    </p>
+                    <button 
+                      onClick={() => setIsAddRowModalOpen(true)}
+                      className="px-5 py-2 bg-[#34A853] hover:brightness-110 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-sm"
+                    >
+                      Create Initial Headers
+                    </button>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="border-b border-gray-100 bg-gray-50 text-[10px] font-black uppercase tracking-wider text-gray-400">
+                          <th className="px-6 py-3 w-16 text-center">Row</th>
+                          {headers.map((colName, index) => (
+                            <th key={index} className="px-6 py-3 font-bold">
+                              {colName || `Column ${index + 1}`}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {filteredLocalRows.length === 0 ? (
+                          <tr>
+                            <td colSpan={headers.length + 1} className="px-6 py-12 text-center text-xs text-gray-400 italic">
+                              {tableSearch ? "No rows matches your search filter." : "Spreadsheet contains no records beneath row 1 headers."}
+                            </td>
+                          </tr>
+                        ) : (
+                          filteredLocalRows.map((row, rIdx) => (
+                            <tr key={rIdx} className="hover:bg-gray-50/40 transition-colors">
+                              {/* Row number indicator */}
+                              <td className="px-6 py-3.5 text-center text-[10px] font-black text-gray-400 bg-gray-50/20 font-mono">
+                                {rIdx + 2}
+                              </td>
+                              
+                              {/* Cells loop */}
+                              {headers.map((_, cIdx) => {
+                                const cellValue = row[cIdx] || "";
+                                const isId = cellValue.startsWith("CAMP-") || cellValue.startsWith("CRE-");
+                                const isNumber = !isNaN(Number(cellValue)) && cellValue.trim() !== "";
+                                
+                                return (
+                                  <td 
+                                    key={cIdx} 
+                                    className={cn(
+                                      "px-6 py-3.5 text-sm font-semibold text-gray-700 min-w-[140px]",
+                                      isId ? "font-mono text-xs font-bold text-gray-900" : "",
+                                      isNumber ? "font-mono font-bold text-emerald-600" : ""
+                                    )}
+                                  >
+                                    {/* Handle common labels */}
+                                    {cellValue === "Active" ? (
+                                      <span className="px-2 py-0.5 bg-green-50 text-green-600 rounded-md text-[10px] font-bold uppercase tracking-wide">
+                                        Active
+                                      </span>
+                                    ) : cellValue === "Completed" ? (
+                                      <span className="px-2 py-0.5 bg-blue-50 text-blue-600 rounded-md text-[10px] font-bold uppercase tracking-wide">
+                                        Completed
+                                      </span>
+                                    ) : cellValue === "Pending" ? (
+                                      <span className="px-2 py-0.5 bg-amber-50 text-amber-600 rounded-md text-[10px] font-bold uppercase tracking-wide">
+                                        Pending
+                                      </span>
+                                    ) : (
+                                      cellValue
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* CREATE TRACKER SHEET MODAL */}
+      {isCreateSheetModalOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm transition-opacity">
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl border border-gray-100"
+          >
+            <h3 className="font-bold text-lg text-[#141414] mb-2 uppercase tracking-tight">New Campaign Tracker</h3>
+            <p className="text-xs text-gray-500 font-medium mb-4">Creates a pre-formatted spreadsheet inside your Google Sheets workspace to monitor UGC performance and costs.</p>
+            
+            <form onSubmit={handleCreateCampaignSheet} className="space-y-4">
+              <div>
+                <label className="text-[10px] font-black uppercase tracking-wider text-gray-400 block mb-1">Spreadsheet Title</label>
+                <input 
+                  type="text" 
+                  placeholder="e.g., Q3 TikTok Campaign Tracker"
+                  required
+                  value={newSheetTitle}
+                  onChange={(e) => setNewSheetTitle(e.target.value)}
+                  className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-xs font-semibold outline-none focus:ring-2 focus:ring-[#34A853]/20 transition-all"
+                />
+              </div>
+
+              <div className="flex gap-3 justify-end pt-2">
+                <button 
+                  type="button" 
+                  onClick={() => setIsCreateSheetModalOpen(false)}
+                  className="px-4 py-2 bg-gray-100 text-gray-700 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-gray-200 transition-all"
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="submit" 
+                  disabled={creatingSheet || !newSheetTitle.trim()}
+                  className="px-5 py-2 bg-[#34A853] text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:brightness-110 disabled:opacity-50 transition-all shadow-sm"
+                >
+                  {creatingSheet ? "Creating..." : "Build Tracker"}
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+
+      {/* DYNAMIC APPEND ROW MODAL */}
+      {isAddRowModalOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm overflow-y-auto">
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl border border-gray-100 my-8"
+          >
+            <h3 className="font-bold text-lg text-[#141414] mb-1 uppercase tracking-tight">Append Spreadsheet Entry</h3>
+            <p className="text-xs text-gray-500 font-medium mb-5">Adds a new record directly onto the active Google Spreadsheet tab.</p>
+            
+            <form onSubmit={handleAddRowSubmit} className="space-y-4 max-h-[60vh] overflow-y-auto pr-2">
+              {headers.map((columnName, idx) => {
+                if (!columnName) return null;
+                const isStatusField = columnName.toLowerCase().includes("status");
+                
+                return (
+                  <div key={idx}>
+                    <label className="text-[10px] font-black uppercase tracking-wider text-gray-400 block mb-1">
+                      {columnName}
+                    </label>
+                    
+                    {isStatusField ? (
+                      <select
+                        value={newRowData[columnName] || ""}
+                        onChange={(e) => setNewRowData({ ...newRowData, [columnName]: e.target.value })}
+                        className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-semibold outline-none focus:ring-2 focus:ring-[#34A853]/20 transition-all"
+                      >
+                        <option value="">-- Choose Status --</option>
+                        <option value="Active">Active</option>
+                        <option value="Completed">Completed</option>
+                        <option value="Pending">Pending</option>
+                      </select>
+                    ) : (
+                      <input 
+                        type="text" 
+                        placeholder={`Enter values for '${columnName}'`}
+                        value={newRowData[columnName] || ""}
+                        onChange={(e) => setNewRowData({ ...newRowData, [columnName]: e.target.value })}
+                        className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl text-xs font-semibold outline-none focus:ring-2 focus:ring-[#34A853]/20 transition-all"
+                      />
+                    )}
+                  </div>
+                );
+              })}
+
+              <div className="flex gap-3 justify-end pt-4 sticky bottom-0 bg-white border-t border-gray-50">
+                <button 
+                  type="button" 
+                  onClick={() => setIsAddRowModalOpen(false)}
+                  className="px-4 py-2 bg-gray-100 text-gray-700 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-gray-200 transition-all"
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="submit" 
+                  disabled={submittingRow}
+                  className="px-5 py-2 bg-[#34A853] text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:brightness-110 disabled:opacity-50 transition-all shadow-sm"
+                >
+                  {submittingRow ? "Syncing..." : "Append Row"}
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+    </div>
+  );
+}
